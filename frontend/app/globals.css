@@ -1,0 +1,103 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* =========================================================
+   Design system — single source of truth for color palette.
+   ========================================================= */
+:root {
+  --color-espresso: #5B4A3E;
+  --color-shadow: #8A8077;
+  --color-oat: #CBBFAF;
+  --color-ivory: #E8DED4;
+  --color-sunlit: #F6F2EB;
+  --color-burgundy: #6D001A;
+}
+
+/* =========================================================
+   Base resets
+   ========================================================= */
+@layer base {
+  html {
+    font-family: var(--font-inter), Inter, ui-sans-serif, system-ui, sans-serif;
+    background-color: #F6F2EB;
+    color: #5B4A3E;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    @apply text-espresso bg-sunlit font-sans;
+    line-height: 1.65;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    @apply text-espresso font-serif font-semibold;
+    line-height: 1.3;
+  }
+
+  a {
+    @apply text-espresso hover:text-burgundy transition-colors;
+  }
+
+  :focus-visible {
+    outline: 2px solid #6D001A;
+    outline-offset: 2px;
+  }
+}
+
+/* =========================================================
+   Utility classes used across components
+   ========================================================= */
+@layer components {
+  /* Card surface */
+  .card {
+    @apply bg-ivory rounded-[10px] border border-oat;
+  }
+
+  /* Primary action button */
+  .btn-primary {
+    @apply bg-burgundy text-sunlit font-medium rounded-[10px] px-5 py-2.5 text-sm
+           hover:bg-burgundy/90 active:bg-burgundy/80 transition-colors
+           disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
+  /* Secondary / outline button */
+  .btn-secondary {
+    @apply border border-oat bg-ivory text-espresso font-medium rounded-[10px] px-5 py-2.5 text-sm
+           hover:bg-oat/20 active:bg-oat/30 transition-colors
+           disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
+  /* Ghost button */
+  .btn-ghost {
+    @apply text-espresso font-medium rounded-[10px] px-5 py-2.5 text-sm
+           hover:bg-oat/20 active:bg-oat/30 transition-colors
+           disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
+  /* Danger button */
+  .btn-danger {
+    @apply bg-burgundy text-sunlit font-medium rounded-[10px] px-5 py-2.5 text-sm
+           hover:bg-burgundy/90 active:bg-burgundy/80 transition-colors
+           disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
+  /* Form input */
+  .form-input {
+    @apply bg-sunlit border border-oat rounded-[10px] px-4 py-2.5 text-sm
+           text-espresso w-full placeholder:text-shadow
+           focus:outline-none focus:border-burgundy focus:ring-1 focus:ring-burgundy
+           disabled:opacity-50;
+  }
+
+  /* Status pill / chip */
+  .chip {
+    @apply inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-oat/30 border border-oat text-espresso;
+  }
+}
