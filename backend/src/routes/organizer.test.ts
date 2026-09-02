@@ -334,7 +334,7 @@ describe('Phase 3 - Organizer Event Management APIs', () => {
         .send(payloadWithOrgId)
         .expect(400);
 
-      expect(res.body.message).toContain('Forbidden field');
+      expect(res.body.error.message).toContain('Forbidden field');
 
       // Test with details nest containing organizationId
       const payloadWithNestedOrgId = {
@@ -351,7 +351,69 @@ describe('Phase 3 - Organizer Event Management APIs', () => {
         .send(payloadWithNestedOrgId)
         .expect(400);
 
-      expect(res2.body.message).toContain('Forbidden field');
+      expect(res2.body.error.message).toContain('Forbidden field');
+    });
+
+    test('2b. A request containing client-supplied slug in the body is rejected with 400', async () => {
+      const payloadWithSlug = {
+        ...baseEventPayload,
+        slug: 'custom-user-supplied-slug',
+      };
+
+      const res = await request(app)
+        .post('/api/organizer/events')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send(payloadWithSlug)
+        .expect(400);
+
+      expect(res.body.error.message).toContain('Forbidden field');
+    });
+
+    test('2c. Creating two events with an identical title produces two distinct, valid, non-undefined slugs that resolve via GET /api/events/:slug once published', async () => {
+      const title = 'Identical Title Event';
+      const event1Payload = { ...baseEventPayload, title };
+      const event2Payload = { ...baseEventPayload, title };
+
+      const res1 = await request(app)
+        .post('/api/organizer/events')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send(event1Payload)
+        .expect(201);
+
+      const res2 = await request(app)
+        .post('/api/organizer/events')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send(event2Payload)
+        .expect(201);
+
+      const slug1: string = res1.body.slug;
+      const slug2: string = res2.body.slug;
+
+      expect(slug1).toBeDefined();
+      expect(slug2).toBeDefined();
+      expect(slug1).not.toContain('undefined');
+      expect(slug2).not.toContain('undefined');
+      expect(slug1.startsWith('identical-title-event-')).toBe(true);
+      expect(slug2.startsWith('identical-title-event-')).toBe(true);
+      expect(slug1).not.toEqual(slug2);
+
+      // Publish both events
+      await request(app)
+        .patch(`/api/organizer/events/${res1.body.id}/publish`)
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .expect(200);
+
+      await request(app)
+        .patch(`/api/organizer/events/${res2.body.id}/publish`)
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .expect(200);
+
+      // Verify both resolve via public GET /api/events/:slug
+      const public1 = await request(app).get(`/api/events/${slug1}`).expect(200);
+      const public2 = await request(app).get(`/api/events/${slug2}`).expect(200);
+
+      expect(public1.body.id).toBe(res1.body.id);
+      expect(public2.body.id).toBe(res2.body.id);
     });
 
     test('3. Hackathon requires hackathon_details; workshop requires workshop_details; internship requires internship_details', async () => {
@@ -650,6 +712,48 @@ describe('Phase 3 - Organizer Event Management APIs', () => {
         .send(baseEventPayload)
         .expect(404);
     });
+
+    test('3. Updating title on an event does NOT change its slug, and client-supplied slug is rejected with 400', async () => {
+      // Create an event
+      const createRes = await request(app)
+        .post('/api/organizer/events')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send(baseEventPayload)
+        .expect(201);
+
+      const eventId = createRes.body.id;
+      const originalSlug = createRes.body.slug;
+      expect(originalSlug).toBeDefined();
+
+      // Update title
+      const updatePayload = {
+        ...baseEventPayload,
+        title: 'Completely Brand New Event Title',
+      };
+
+      const updateRes = await request(app)
+        .put(`/api/organizer/events/${eventId}`)
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send(updatePayload)
+        .expect(200);
+
+      expect(updateRes.body.title).toBe('Completely Brand New Event Title');
+      expect(updateRes.body.slug).toBe(originalSlug);
+
+      // Attempt PUT with client-supplied slug in body
+      const payloadWithSlug = {
+        ...baseEventPayload,
+        slug: 'attempt-to-overwrite-slug',
+      };
+
+      const errRes = await request(app)
+        .put(`/api/organizer/events/${eventId}`)
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send(payloadWithSlug)
+        .expect(400);
+
+      expect(errRes.body.error.message).toContain('Forbidden field');
+    });
   });
 
   describe('4. PUBLISH / UNPUBLISH', () => {
@@ -888,7 +992,7 @@ describe('Phase 3 - Organizer Event Management APIs', () => {
         .send(payload)
         .expect(400);
 
-      expect(res.body.errors[0].message).toContain(
+      expect(res.body.error.errors.mode).toContain(
         'Online events must not include venue or location_id',
       );
     });
@@ -969,6 +1073,337 @@ describe('Phase 3 - Organizer Event Management APIs', () => {
         .set('Authorization', `Bearer ${orgAToken}`)
         .send(payload)
         .expect(400);
+    });
+  });
+
+  describe('Two-Tier Taxonomies & Custom Tag/Category Management', () => {
+    test('1. GET /api/organizer/tags returns system tags + own org custom tags, never another org custom tags', async () => {
+      // Create custom tag for Org A
+      const tagARes = await request(app)
+        .post('/api/organizer/tags')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send({ label: 'Org A Specific Tag', category: 'technology' })
+        .expect(201);
+
+      // Create custom tag for Org B
+      const tagBRes = await request(app)
+        .post('/api/organizer/tags')
+        .set('Authorization', `Bearer ${orgBToken}`)
+        .send({ label: 'Org B Specific Tag', category: 'technology' })
+        .expect(201);
+
+      // Fetch tags as Org A
+      const resA = await request(app)
+        .get('/api/organizer/tags')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .expect(200);
+
+      const tagNamesA: string[] = resA.body.map((t: any) => t.name);
+      expect(tagNamesA).toContain('Org A Specific Tag');
+      expect(tagNamesA).not.toContain('Org B Specific Tag');
+      // System tag presence check
+      expect(resA.body.some((t: any) => t.isSystem === true)).toBe(true);
+
+      // Fetch tags as Org B
+      const resB = await request(app)
+        .get('/api/organizer/tags')
+        .set('Authorization', `Bearer ${orgBToken}`)
+        .expect(200);
+
+      const tagNamesB: string[] = resB.body.map((t: any) => t.name);
+      expect(tagNamesB).toContain('Org B Specific Tag');
+      expect(tagNamesB).not.toContain('Org A Specific Tag');
+    });
+
+    test('2. GET /api/organizer/eligibility-categories returns system + own org custom categories, never another org', async () => {
+      // Create custom category for Org A
+      await request(app)
+        .post('/api/organizer/eligibility-categories')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send({ label: 'Org A Custom Eligibility' })
+        .expect(201);
+
+      // Create custom category for Org B
+      await request(app)
+        .post('/api/organizer/eligibility-categories')
+        .set('Authorization', `Bearer ${orgBToken}`)
+        .send({ label: 'Org B Custom Eligibility' })
+        .expect(201);
+
+      const resA = await request(app)
+        .get('/api/organizer/eligibility-categories')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .expect(200);
+
+      const namesA = resA.body.map((c: any) => c.name);
+      expect(namesA).toContain('Org A Custom Eligibility');
+      expect(namesA).not.toContain('Org B Custom Eligibility');
+
+      const resB = await request(app)
+        .get('/api/organizer/eligibility-categories')
+        .set('Authorization', `Bearer ${orgBToken}`)
+        .expect(200);
+
+      const namesB = resB.body.map((c: any) => c.name);
+      expect(namesB).toContain('Org B Custom Eligibility');
+      expect(namesB).not.toContain('Org A Custom Eligibility');
+    });
+
+    test('3. POST /api/organizer/tags with brand-new label creates org-scoped row with is_system=false', async () => {
+      const res = await request(app)
+        .post('/api/organizer/tags')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send({ label: '  Unique AI Security  ', category: 'technology' })
+        .expect(201);
+
+      expect(res.body.name).toBe('Unique AI Security');
+      expect(res.body.slug).toBe('unique-ai-security');
+      expect(res.body.isSystem).toBe(false);
+      expect(res.body.organizationId).toBe(orgAId);
+    });
+
+    test('4. POST /api/organizer/tags matching existing SYSTEM tag slug returns existing system row', async () => {
+      // Fetch system tags
+      const list = await request(app)
+        .get('/api/organizer/tags')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .expect(200);
+
+      const systemTag = list.body.find((t: any) => t.isSystem === true);
+      expect(systemTag).toBeDefined();
+
+      // Post with system tag's name in different casing/spacing
+      const res = await request(app)
+        .post('/api/organizer/tags')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send({ label: `  ${systemTag.name.toUpperCase()}  `, category: systemTag.category })
+        .expect(201);
+
+      expect(res.body.id).toBe(systemTag.id);
+      expect(res.body.isSystem).toBe(true);
+      expect(res.body.organizationId).toBeNull();
+    });
+
+    test('5. POST /api/organizer/tags matching own existing custom tag returns existing row', async () => {
+      const firstRes = await request(app)
+        .post('/api/organizer/tags')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send({ label: 'My Custom Tag Name', category: 'domain' })
+        .expect(201);
+
+      const secondRes = await request(app)
+        .post('/api/organizer/tags')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send({ label: '  my--custom-tag-name  ', category: 'domain' })
+        .expect(201);
+
+      expect(secondRes.body.id).toBe(firstRes.body.id);
+    });
+
+    test('6. Independent custom tags with same label created by two orgs do not collide', async () => {
+      const tagA = await request(app)
+        .post('/api/organizer/tags')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send({ label: 'Common Name Tag', category: 'theme' })
+        .expect(201);
+
+      const tagB = await request(app)
+        .post('/api/organizer/tags')
+        .set('Authorization', `Bearer ${orgBToken}`)
+        .send({ label: 'Common Name Tag', category: 'theme' })
+        .expect(201);
+
+      expect(tagA.body.id).not.toBe(tagB.body.id);
+      expect(tagA.body.organizationId).toBe(orgAId);
+      expect(tagB.body.organizationId).toBe(orgBId);
+      expect(tagA.body.isSystem).toBe(false);
+      expect(tagB.body.isSystem).toBe(false);
+    });
+
+    test('7. Eligibility categories dedup behavior (system match, custom match, multi-org)', async () => {
+      // System category match
+      const sysList = await request(app)
+        .get('/api/organizer/eligibility-categories')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .expect(200);
+
+      const sysCat = sysList.body.find((c: any) => c.isSystem === true);
+      expect(sysCat).toBeDefined();
+
+      const matchSysRes = await request(app)
+        .post('/api/organizer/eligibility-categories')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send({ label: sysCat.name.toLowerCase() })
+        .expect(201);
+
+      expect(matchSysRes.body.id).toBe(sysCat.id);
+      expect(matchSysRes.body.isSystem).toBe(true);
+
+      // Multi-org independent custom creation
+      const catA = await request(app)
+        .post('/api/organizer/eligibility-categories')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send({ label: 'Ph.D Students Only' })
+        .expect(201);
+
+      const catB = await request(app)
+        .post('/api/organizer/eligibility-categories')
+        .set('Authorization', `Bearer ${orgBToken}`)
+        .send({ label: 'Ph.D Students Only' })
+        .expect(201);
+
+      expect(catA.body.id).not.toBe(catB.body.id);
+    });
+
+    test('8. POST /api/organizer/events with tag_id of another organization custom tag is rejected with 400', async () => {
+      const foreignTag = await request(app)
+        .post('/api/organizer/tags')
+        .set('Authorization', `Bearer ${orgBToken}`)
+        .send({ label: 'Org B Secret Tag', category: 'technology' })
+        .expect(201);
+
+      const payload = {
+        ...makeBasePayload(),
+        tag_ids: [testTagId, foreignTag.body.id],
+      };
+
+      const res = await request(app)
+        .post('/api/organizer/events')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send(payload)
+        .expect(400);
+
+      expect(res.body.error).toContain('Invalid tag_ids');
+    });
+
+    test('9. POST /api/organizer/events with system + own org custom tag_ids succeeds', async () => {
+      const ownTag = await request(app)
+        .post('/api/organizer/tags')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send({ label: 'Org A Approved Tag', category: 'domain' })
+        .expect(201);
+
+      const payload = {
+        ...makeBasePayload(),
+        tag_ids: [testTagId, ownTag.body.id],
+      };
+
+      await request(app)
+        .post('/api/organizer/events')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send(payload)
+        .expect(201);
+    });
+
+    test('10. PUT /api/organizer/events/:id ownership checks for tag_ids and eligibility_category_ids', async () => {
+      const foreignTag = await request(app)
+        .post('/api/organizer/tags')
+        .set('Authorization', `Bearer ${orgBToken}`)
+        .send({ label: 'Org B Exclusive Tag', category: 'technology' })
+        .expect(201);
+
+      const foreignCat = await request(app)
+        .post('/api/organizer/eligibility-categories')
+        .set('Authorization', `Bearer ${orgBToken}`)
+        .send({ label: 'Org B Exclusive Category' })
+        .expect(201);
+
+      const ownTag = await request(app)
+        .post('/api/organizer/tags')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send({ label: 'Org A Valid Edit Tag', category: 'technology' })
+        .expect(201);
+
+      const ownCat = await request(app)
+        .post('/api/organizer/eligibility-categories')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send({ label: 'Org A Valid Edit Category' })
+        .expect(201);
+
+      const eventRes = await request(app)
+        .post('/api/organizer/events')
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send(makeBasePayload())
+        .expect(201);
+
+      const eventId = eventRes.body.id;
+
+      // Reject foreign tag on PUT
+      await request(app)
+        .put(`/api/organizer/events/${eventId}`)
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send({ ...makeBasePayload(), tag_ids: [foreignTag.body.id] })
+        .expect(400);
+
+      // Reject foreign eligibility category on PUT
+      await request(app)
+        .put(`/api/organizer/events/${eventId}`)
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send({ ...makeBasePayload(), eligibility_category_ids: [foreignCat.body.id] })
+        .expect(400);
+
+      // Accept own tag and category on PUT
+      await request(app)
+        .put(`/api/organizer/events/${eventId}`)
+        .set('Authorization', `Bearer ${orgAToken}`)
+        .send({
+          ...makeBasePayload(),
+          tag_ids: [ownTag.body.id],
+          eligibility_category_ids: [ownCat.body.id],
+        })
+        .expect(200);
+    });
+
+    test('11. Database-level partial unique index constraint enforcement & backfill check', async () => {
+      // 1. Backfill verification: pre-seeded system rows have is_system = true and organization_id = null
+      const systemTags = await db.select().from(tags).where(eq(tags.isSystem, true));
+      expect(systemTags.length).toBeGreaterThan(0);
+      systemTags.forEach((t) => {
+        expect(t.organizationId).toBeNull();
+      });
+
+      const systemCats = await db
+        .select()
+        .from(eligibilityCategories)
+        .where(eq(eligibilityCategories.isSystem, true));
+      expect(systemCats.length).toBeGreaterThan(0);
+      systemCats.forEach((c) => {
+        expect(c.organizationId).toBeNull();
+      });
+
+      // 2. Direct duplicate system insert violation
+      const sampleSysTag = systemTags[0];
+      await expect(
+        db.insert(tags).values({
+          name: 'Duplicate System Tag Name',
+          slug: sampleSysTag.slug,
+          category: 'technology',
+          isSystem: true,
+          organizationId: null,
+        }),
+      ).rejects.toThrow();
+
+      // 3. Direct duplicate custom insert for same org violation
+      const customTag = await db
+        .insert(tags)
+        .values({
+          name: 'Direct DB Custom Tag',
+          slug: 'direct-db-custom-tag',
+          category: 'technology',
+          isSystem: false,
+          organizationId: orgAId,
+        })
+        .returning();
+
+      await expect(
+        db.insert(tags).values({
+          name: 'Direct DB Custom Tag Duplicate',
+          slug: 'direct-db-custom-tag',
+          category: 'technology',
+          isSystem: false,
+          organizationId: orgAId,
+        }),
+      ).rejects.toThrow();
     });
   });
 });

@@ -1,4 +1,4 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { eq, asc, desc, and, count } from 'drizzle-orm';
 import { db } from '../db/client';
@@ -103,7 +103,7 @@ router.get(
   '/me/saved',
   requireAuth,
   requireRole('student'),
-  async (req: Request, res: Response) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     try {
       const parsed = listQuerySchema.parse(req.query);
       const offset = (parsed.page - 1) * parsed.limit;
@@ -174,10 +174,7 @@ router.get(
         data: formattedData,
       });
     } catch (error) {
-      if (error instanceof z.ZodError) {
-        return res.status(400).json({ errors: error.issues });
-      }
-      return res.status(500).json({ message: 'Internal server error' });
+      next(error);
     }
   },
 );
@@ -286,7 +283,7 @@ router.get(
   '/me/registrations',
   requireAuth,
   requireRole('student'),
-  async (req: Request, res: Response) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     try {
       const parsed = listQuerySchema.parse(req.query);
       const offset = (parsed.page - 1) * parsed.limit;
@@ -364,10 +361,7 @@ router.get(
         data: formattedData,
       });
     } catch (error) {
-      if (error instanceof z.ZodError) {
-        return res.status(400).json({ errors: error.issues });
-      }
-      return res.status(500).json({ message: 'Internal server error' });
+      next(error);
     }
   },
 );

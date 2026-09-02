@@ -49,6 +49,9 @@ npm run dev
 
 The backend server runs on `http://localhost:4000` (by default) with live-reloading.
 
+> **Note on TLS / Network Security:** All backend npm scripts set `NODE_OPTIONS=--use-system-ca`. This instructs Node.js to trust operating system root certificate stores in addition to Node's built-in certificates. This prevents `fetch failed` / `UNABLE_TO_VERIFY_LEAF_SIGNATURE` errors when calling external services like the Gemini API on networks with TLS inspection or managed security/antivirus software.
+
+
 ### 3. API Documentation (Swagger UI)
 
 When the backend server is running, the interactive Swagger API documentation is available at:

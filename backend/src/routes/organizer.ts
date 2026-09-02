@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
-import { eq, desc, and, count, inArray, asc } from 'drizzle-orm';
+import { eq, desc, and, count, inArray, asc, or } from 'drizzle-orm';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
@@ -17,6 +17,8 @@ import {
   organizationInvitations,
   organizations,
   locations,
+  tags,
+  eligibilityCategories,
   eventCustomFields,
   eventRegistrations,
   eventRegistrationResponses,
@@ -24,8 +26,64 @@ import {
 } from '../db/schema';
 import { requireAuth, requireRole } from '../middleware/auth';
 import { generateRandomToken, hashToken } from '../utils/token';
+import { generateUniqueSlug } from '../utils/slug';
+import { getOrCreateTag, getOrCreateEligibilityCategory } from '../utils/taxonomy';
+import { ValidationError, NotFoundError, ForbiddenError, ConflictError } from '../errors/AppError';
+import { enqueueEmbeddingJob, hasEmbeddingRelevantChanges } from '../services/embeddingJob';
 
 const router = Router();
+
+// Helper: Validate that tag_ids and eligibility_category_ids belong to system tier or current org
+async function validateTaxonomyOwnership(
+  dbOrTx: any,
+  organizationId: string,
+  tagIds: number[],
+  eligibilityCategoryIds: number[],
+) {
+  if (tagIds && tagIds.length > 0) {
+    const foundTags = await dbOrTx
+      .select({ id: tags.id, isSystem: tags.isSystem, organizationId: tags.organizationId })
+      .from(tags)
+      .where(inArray(tags.id, tagIds));
+
+    const validTagIdSet = new Set(
+      foundTags
+        .filter((t: any) => t.isSystem || t.organizationId === organizationId)
+        .map((t: any) => t.id),
+    );
+
+    const invalidTagIds = tagIds.filter((id) => !validTagIdSet.has(id));
+    if (invalidTagIds.length > 0) {
+      throw new ValidationError(
+        `Invalid tag_ids: [${invalidTagIds.join(', ')}] are either invalid or belong to another organization`,
+      );
+    }
+  }
+
+  if (eligibilityCategoryIds && eligibilityCategoryIds.length > 0) {
+    const foundCategories = await dbOrTx
+      .select({
+        id: eligibilityCategories.id,
+        isSystem: eligibilityCategories.isSystem,
+        organizationId: eligibilityCategories.organizationId,
+      })
+      .from(eligibilityCategories)
+      .where(inArray(eligibilityCategories.id, eligibilityCategoryIds));
+
+    const validCatIdSet = new Set(
+      foundCategories
+        .filter((c: any) => c.isSystem || c.organizationId === organizationId)
+        .map((c: any) => c.id),
+    );
+
+    const invalidCategoryIds = eligibilityCategoryIds.filter((id) => !validCatIdSet.has(id));
+    if (invalidCategoryIds.length > 0) {
+      throw new ValidationError(
+        `Invalid eligibility_category_ids: [${invalidCategoryIds.join(', ')}] are either invalid or belong to another organization`,
+      );
+    }
+  }
+}
 
 // Helper to recursively check if organization_id or organizationId exists in request body
 function hasOrganizationId(obj: any): boolean {
@@ -37,6 +95,22 @@ function hasOrganizationId(obj: any): boolean {
   }
   for (const key of Object.keys(obj)) {
     if (hasOrganizationId(obj[key])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Helper to recursively check if slug exists in request body
+function hasSlugInBody(obj: any): boolean {
+  if (!obj || typeof obj !== 'object') {
+    return false;
+  }
+  if ('slug' in obj) {
+    return true;
+  }
+  for (const key of Object.keys(obj)) {
+    if (hasSlugInBody(obj[key])) {
       return true;
     }
   }
@@ -73,7 +147,7 @@ const upload = multer({
 const uploadMiddleware = (req: Request, res: Response, next: NextFunction) => {
   upload.single('banner')(req, res, (err) => {
     if (err) {
-      return res.status(400).json({ message: err.message });
+      return next(err);
     }
     next();
   });
@@ -286,6 +360,213 @@ async function enrichEventResponse(eventRow: any) {
 
 /**
  * @openapi
+ * /api/organizer/tags:
+ *   get:
+ *     summary: List all system tags and current organization's custom tags
+ *     tags: [Organizer]
+ *     security:
+ *       - BearerAuth: []
+ *     responses:
+ *       200:
+ *         description: List of accessible tags
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden
+ */
+router.get(
+  '/tags',
+  requireAuth,
+  requireRole('organizer'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const organizationId = req.user?.organizationId;
+      if (!organizationId) {
+        throw new ValidationError('Organizer has no organization ID associated');
+      }
+
+      const availableTags = await db
+        .select()
+        .from(tags)
+        .where(
+          or(
+            eq(tags.isSystem, true),
+            and(eq(tags.isSystem, false), eq(tags.organizationId, organizationId)),
+          ),
+        )
+        .orderBy(asc(tags.name));
+
+      return res.status(200).json(availableTags);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+/**
+ * @openapi
+ * /api/organizer/tags:
+ *   post:
+ *     summary: Create or get an org-scoped custom tag
+ *     tags: [Organizer]
+ *     security:
+ *       - BearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [label, category]
+ *             properties:
+ *               label:
+ *                 type: string
+ *               category:
+ *                 type: string
+ *                 enum: [domain, technology, theme]
+ *     responses:
+ *       201:
+ *         description: Tag created or reused
+ *       400:
+ *         description: Validation error
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden
+ */
+const createTagSchema = z.object({
+  label: z.string().min(1, 'Tag label is required'),
+  category: z.enum(['domain', 'technology', 'theme']),
+});
+
+router.post(
+  '/tags',
+  requireAuth,
+  requireRole('organizer'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const organizationId = req.user?.organizationId;
+      if (!organizationId) {
+        throw new ValidationError('Organizer has no organization ID associated');
+      }
+
+      const validated = createTagSchema.parse(req.body);
+      const tagRow = await getOrCreateTag(db, validated.label, validated.category, organizationId);
+
+      return res.status(201).json(tagRow);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+/**
+ * @openapi
+ * /api/organizer/eligibility-categories:
+ *   get:
+ *     summary: List all system eligibility categories and current organization's custom categories
+ *     tags: [Organizer]
+ *     security:
+ *       - BearerAuth: []
+ *     responses:
+ *       200:
+ *         description: List of accessible eligibility categories
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden
+ */
+router.get(
+  '/eligibility-categories',
+  requireAuth,
+  requireRole('organizer'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const organizationId = req.user?.organizationId;
+      if (!organizationId) {
+        throw new ValidationError('Organizer has no organization ID associated');
+      }
+
+      const availableCategories = await db
+        .select()
+        .from(eligibilityCategories)
+        .where(
+          or(
+            eq(eligibilityCategories.isSystem, true),
+            and(
+              eq(eligibilityCategories.isSystem, false),
+              eq(eligibilityCategories.organizationId, organizationId),
+            ),
+          ),
+        )
+        .orderBy(asc(eligibilityCategories.name));
+
+      return res.status(200).json(availableCategories);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+/**
+ * @openapi
+ * /api/organizer/eligibility-categories:
+ *   post:
+ *     summary: Create or get an org-scoped custom eligibility category
+ *     tags: [Organizer]
+ *     security:
+ *       - BearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [label]
+ *             properties:
+ *               label:
+ *                 type: string
+ *     responses:
+ *       201:
+ *         description: Eligibility category created or reused
+ *       400:
+ *         description: Validation error
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden
+ */
+const createEligibilityCategorySchema = z.object({
+  label: z.string().min(1, 'Category label is required'),
+});
+
+router.post(
+  '/eligibility-categories',
+  requireAuth,
+  requireRole('organizer'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const organizationId = req.user?.organizationId;
+      if (!organizationId) {
+        throw new ValidationError('Organizer has no organization ID associated');
+      }
+
+      const validated = createEligibilityCategorySchema.parse(req.body);
+      const categoryRow = await getOrCreateEligibilityCategory(
+        db,
+        validated.label,
+        organizationId,
+      );
+
+      return res.status(201).json(categoryRow);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+/**
+ * @openapi
  * /api/organizer/members/invite:
  *   post:
  *     summary: Invite a new member to the organization (Owner-only)
@@ -332,12 +613,10 @@ router.post(
   '/members/invite',
   requireAuth,
   requireRole('organizer'),
-  async (req: Request, res: Response) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     try {
       if (req.user?.membershipRole !== 'owner') {
-        return res
-          .status(403)
-          .json({ message: 'Forbidden: Only organization owners can invite members' });
+        throw new ForbiddenError('Forbidden: Only organization owners can invite members');
       }
 
       const validated = inviteMemberSchema.parse(req.body);
@@ -345,7 +624,7 @@ router.post(
       const invitedById = req.user.id;
 
       if (!organizationId) {
-        return res.status(400).json({ message: 'Owner has no organization ID associated' });
+        throw new ValidationError('Owner has no organization ID associated');
       }
 
       const [existingAccount] = await db
@@ -355,7 +634,7 @@ router.post(
         .limit(1);
 
       if (existingAccount) {
-        return res.status(400).json({ message: 'User is already an organizer' });
+        throw new ValidationError('User is already an organizer');
       }
 
       const rawToken = generateRandomToken();
@@ -381,10 +660,7 @@ router.post(
 
       return res.status(201).json(responsePayload);
     } catch (error) {
-      if (error instanceof z.ZodError) {
-        return res.status(400).json({ errors: error.issues });
-      }
-      return res.status(500).json({ message: 'Internal server error' });
+      next(error);
     }
   },
 );
@@ -536,13 +812,16 @@ router.post(
   '/events',
   requireAuth,
   requireRole('organizer'),
-  async (req: Request, res: Response) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     try {
       // Reject if organization_id is in request body
       if (hasOrganizationId(req.body)) {
-        return res
-          .status(400)
-          .json({ message: 'Forbidden field: organization_id is not allowed in body' });
+        throw new ValidationError('Forbidden field: organization_id is not allowed in body');
+      }
+
+      // Reject if client-supplied slug is in request body
+      if (hasSlugInBody(req.body)) {
+        throw new ValidationError('Forbidden field: slug is not allowed in body');
       }
 
       const validated = eventValidationSchema.parse(req.body);
@@ -550,21 +829,23 @@ router.post(
       const createdBy = req.user?.id;
 
       if (!organizationId) {
-        return res.status(400).json({ message: 'Organizer has no organization ID associated' });
+        throw new ValidationError('Organizer has no organization ID associated');
       }
-
-      // Generate unique slug
-      const generatedSlug =
-        validated.title
-          .toLowerCase()
-          .replace(/[^a-z0-9]+/g, '-')
-          .replace(/(^-|-$)/g, '') +
-        '-' +
-        Math.random().toString(36).substring(2, 8);
 
       let createdEvent: any;
 
       await db.transaction(async (tx) => {
+        // Validate taxonomy ownership (tags and eligibility categories must be system-level or own org's)
+        await validateTaxonomyOwnership(
+          tx,
+          organizationId,
+          validated.tag_ids,
+          validated.eligibility_category_ids,
+        );
+
+        // Generate unique, collision-free slug
+        const generatedSlug = await generateUniqueSlug(validated.title, tx);
+
         // 1. Insert core event
         const [insertedEvent] = await tx
           .insert(events)
@@ -672,10 +953,7 @@ router.post(
       const enriched = await enrichEventResponse(createdEvent);
       return res.status(201).json(enriched);
     } catch (error) {
-      if (error instanceof z.ZodError) {
-        return res.status(400).json({ errors: error.issues });
-      }
-      return res.status(500).json({ message: 'Internal server error' });
+      next(error);
     }
   },
 );
@@ -714,13 +992,13 @@ router.get(
   '/events',
   requireAuth,
   requireRole('organizer'),
-  async (req: Request, res: Response) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { page, limit } = listQuerySchema.parse(req.query);
       const organizationId = req.user?.organizationId;
 
       if (!organizationId) {
-        return res.status(400).json({ message: 'Organizer has no organization ID associated' });
+        throw new ValidationError('Organizer has no organization ID associated');
       }
 
       // Query total count
@@ -752,10 +1030,7 @@ router.get(
         },
       });
     } catch (error) {
-      if (error instanceof z.ZodError) {
-        return res.status(400).json({ errors: error.issues });
-      }
-      return res.status(500).json({ message: 'Internal server error' });
+      next(error);
     }
   },
 );
@@ -916,39 +1191,98 @@ router.put(
   '/events/:id',
   requireAuth,
   requireRole('organizer'),
-  async (req: Request, res: Response) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     try {
       const eventId = req.params.id;
 
       // Reject if organization_id is in request body
       if (hasOrganizationId(req.body)) {
-        return res
-          .status(400)
-          .json({ message: 'Forbidden field: organization_id is not allowed in body' });
+        throw new ValidationError('Forbidden field: organization_id is not allowed in body');
+      }
+
+      // Reject if client-supplied slug is in request body
+      if (hasSlugInBody(req.body)) {
+        throw new ValidationError('Forbidden field: slug is not allowed in body');
       }
 
       const validated = eventValidationSchema.parse(req.body);
       const organizationId = req.user?.organizationId;
 
       if (!organizationId) {
-        return res.status(400).json({ message: 'Organizer has no organization ID associated' });
+        throw new ValidationError('Organizer has no organization ID associated');
       }
 
       // Check event existence and ownership
       const [existingEvent] = await db.select().from(events).where(eq(events.id, eventId)).limit(1);
 
       if (!existingEvent) {
-        return res.status(404).json({ message: 'Event not found' });
+        throw new NotFoundError('Event not found');
       }
 
       if (existingEvent.organizationId !== organizationId) {
-        return res.status(403).json({ message: 'Forbidden: You do not own this event' });
+        throw new ForbiddenError('Forbidden: You do not own this event');
+      }
+
+      // If event is published, check if any embedding-relevant fields changed
+      let shouldReEmbed = false;
+      if (existingEvent.status === 'published') {
+        const oldTags = await db.select({ tagId: eventTags.tagId }).from(eventTags).where(eq(eventTags.eventId, eventId));
+        const oldCats = await db
+          .select({ categoryId: eventEligibility.eligibilityCategoryId })
+          .from(eventEligibility)
+          .where(eq(eventEligibility.eventId, eventId));
+
+        let oldPrizeSummary: string | null = null;
+        if (existingEvent.eventType === 'hackathon') {
+          const [h] = await db
+            .select({ prizeSummaryText: hackathonDetails.prizeSummaryText })
+            .from(hackathonDetails)
+            .where(eq(hackathonDetails.eventId, eventId))
+            .limit(1);
+          if (h) oldPrizeSummary = h.prizeSummaryText;
+        }
+
+        const oldState = {
+          title: existingEvent.title,
+          tagline: existingEvent.tagline,
+          description: existingEvent.description,
+          tagIds: oldTags.map((t) => t.tagId),
+          eligibilityCategoryIds: oldCats.map((c) => c.categoryId),
+          eligibilityNotes: existingEvent.eligibilityNotes,
+          prizeSummaryText: oldPrizeSummary,
+        };
+
+        const newState = {
+          title: validated.title,
+          tagline: validated.tagline,
+          description: validated.description,
+          tag_ids: validated.tag_ids,
+          eligibility_category_ids: validated.eligibility_category_ids,
+          eligibility_notes: validated.eligibility_notes,
+          prize_summary_text:
+            validated.event_type === 'hackathon' ? validated.hackathon_details?.prize_summary_text : null,
+        };
+
+        shouldReEmbed = hasEmbeddingRelevantChanges(oldState, newState);
       }
 
       let updatedEvent: any;
 
       await db.transaction(async (tx) => {
+        // Validate taxonomy ownership (tags and eligibility categories must be system-level or own org's)
+        await validateTaxonomyOwnership(
+          tx,
+          organizationId,
+          validated.tag_ids,
+          validated.eligibility_category_ids,
+        );
+
         // 1. Update core fields on events
+        // NOTE: The slug field is intentionally excluded from updates below.
+        // Slug is generated ONCE at creation time, from the title supplied in POST /api/organizer/events.
+        // It must NEVER be regenerated or changed by PUT /api/organizer/events/:id, even if the organizer
+        // edits the title in an update — the slug is the event's stable public URL identifier, and changing
+        // it would break any link already shared to GET /api/events/:slug.
         const [updated] = await tx
           .update(events)
           .set({
@@ -1058,13 +1392,14 @@ router.put(
         }
       });
 
+      if (shouldReEmbed) {
+        enqueueEmbeddingJob(eventId);
+      }
+
       const enriched = await enrichEventResponse(updatedEvent);
       return res.status(200).json(enriched);
     } catch (error) {
-      if (error instanceof z.ZodError) {
-        return res.status(400).json({ errors: error.issues });
-      }
-      return res.status(500).json({ message: 'Internal server error' });
+      next(error);
     }
   },
 );
@@ -1100,28 +1435,28 @@ router.patch(
   '/events/:id/publish',
   requireAuth,
   requireRole('organizer'),
-  async (req: Request, res: Response) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     try {
       const eventId = req.params.id;
       const organizationId = req.user?.organizationId;
 
       if (!organizationId) {
-        return res.status(400).json({ message: 'Organizer has no organization ID associated' });
+        throw new ValidationError('Organizer has no organization ID associated');
       }
 
       // Check event existence and ownership
       const [existingEvent] = await db.select().from(events).where(eq(events.id, eventId)).limit(1);
 
       if (!existingEvent) {
-        return res.status(404).json({ message: 'Event not found' });
+        throw new NotFoundError('Event not found');
       }
 
       if (existingEvent.organizationId !== organizationId) {
-        return res.status(403).json({ message: 'Forbidden: You do not own this event' });
+        throw new ForbiddenError('Forbidden: You do not own this event');
       }
 
       if (existingEvent.status !== 'draft') {
-        return res.status(400).json({ message: 'Only draft events can be published' });
+        throw new ValidationError('Only draft events can be published');
       }
 
       // Only set publishedAt on the first publish
@@ -1137,9 +1472,12 @@ router.patch(
         .where(eq(events.id, eventId))
         .returning();
 
+      // Trigger non-blocking background embedding job
+      enqueueEmbeddingJob(eventId);
+
       return res.status(200).json(updatedEvent);
     } catch (error) {
-      return res.status(500).json({ message: 'Internal server error' });
+      next(error);
     }
   },
 );
@@ -1175,28 +1513,28 @@ router.patch(
   '/events/:id/unpublish',
   requireAuth,
   requireRole('organizer'),
-  async (req: Request, res: Response) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     try {
       const eventId = req.params.id;
       const organizationId = req.user?.organizationId;
 
       if (!organizationId) {
-        return res.status(400).json({ message: 'Organizer has no organization ID associated' });
+        throw new ValidationError('Organizer has no organization ID associated');
       }
 
       // Check event existence and ownership
       const [existingEvent] = await db.select().from(events).where(eq(events.id, eventId)).limit(1);
 
       if (!existingEvent) {
-        return res.status(404).json({ message: 'Event not found' });
+        throw new NotFoundError('Event not found');
       }
 
       if (existingEvent.organizationId !== organizationId) {
-        return res.status(403).json({ message: 'Forbidden: You do not own this event' });
+        throw new ForbiddenError('Forbidden: You do not own this event');
       }
 
       if (existingEvent.status !== 'published') {
-        return res.status(400).json({ message: 'Only published events can be unpublished' });
+        throw new ValidationError('Only published events can be unpublished');
       }
 
       const [updatedEvent] = await db
@@ -1210,7 +1548,7 @@ router.patch(
 
       return res.status(200).json(updatedEvent);
     } catch (error) {
-      return res.status(500).json({ message: 'Internal server error' });
+      next(error);
     }
   },
 );
@@ -1244,24 +1582,24 @@ router.delete(
   '/events/:id',
   requireAuth,
   requireRole('organizer'),
-  async (req: Request, res: Response) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     try {
       const eventId = req.params.id;
       const organizationId = req.user?.organizationId;
 
       if (!organizationId) {
-        return res.status(400).json({ message: 'Organizer has no organization ID associated' });
+        throw new ValidationError('Organizer has no organization ID associated');
       }
 
       // Check event existence and ownership
       const [existingEvent] = await db.select().from(events).where(eq(events.id, eventId)).limit(1);
 
       if (!existingEvent) {
-        return res.status(404).json({ message: 'Event not found' });
+        throw new NotFoundError('Event not found');
       }
 
       if (existingEvent.organizationId !== organizationId) {
-        return res.status(403).json({ message: 'Forbidden: You do not own this event' });
+        throw new ForbiddenError('Forbidden: You do not own this event');
       }
 
       // Hard delete core event - cascades automatically
@@ -1269,7 +1607,7 @@ router.delete(
 
       return res.status(200).json({ message: 'Event deleted successfully' });
     } catch (error) {
-      return res.status(500).json({ message: 'Internal server error' });
+      next(error);
     }
   },
 );
@@ -1317,17 +1655,17 @@ router.post(
   requireAuth,
   requireRole('organizer'),
   uploadMiddleware,
-  async (req: Request, res: Response) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     try {
       const eventId = req.params.id;
       const organizationId = req.user?.organizationId;
 
       if (!organizationId) {
-        return res.status(400).json({ message: 'Organizer has no organization ID associated' });
+        throw new ValidationError('Organizer has no organization ID associated');
       }
 
       if (!req.file) {
-        return res.status(400).json({ message: 'Missing file: banner is required' });
+        throw new ValidationError('Missing file: banner is required');
       }
 
       // Check event existence and ownership
@@ -1336,13 +1674,13 @@ router.post(
       if (!existingEvent) {
         // Clean up file if event not found
         fs.unlinkSync(req.file.path);
-        return res.status(404).json({ message: 'Event not found' });
+        throw new NotFoundError('Event not found');
       }
 
       if (existingEvent.organizationId !== organizationId) {
         // Clean up file if unauthorized
         fs.unlinkSync(req.file.path);
-        return res.status(403).json({ message: 'Forbidden: You do not own this event' });
+        throw new ForbiddenError('Forbidden: You do not own this event');
       }
 
       // Build relative URL/path for local storage.
@@ -1363,7 +1701,7 @@ router.post(
         banner_image_url: bannerImageUrl,
       });
     } catch (error) {
-      return res.status(500).json({ message: 'Internal server error' });
+      next(error);
     }
   },
 );
@@ -1425,27 +1763,27 @@ router.get(
   '/events/:id/custom-fields',
   requireAuth,
   requireRole('organizer'),
-  async (req: Request, res: Response) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     try {
       const eventId = req.params.id;
       const organizationId = req.user?.organizationId;
 
       const parsedId = z.string().uuid().safeParse(eventId);
       if (!parsedId.success) {
-        return res.status(404).json({ message: 'Event not found' });
+        throw new NotFoundError('Event not found');
       }
 
       if (!organizationId) {
-        return res.status(400).json({ message: 'Organizer has no organization ID associated' });
+        throw new ValidationError('Organizer has no organization ID associated');
       }
 
       const [existingEvent] = await db.select().from(events).where(eq(events.id, eventId)).limit(1);
       if (!existingEvent) {
-        return res.status(404).json({ message: 'Event not found' });
+        throw new NotFoundError('Event not found');
       }
 
       if (existingEvent.organizationId !== organizationId) {
-        return res.status(403).json({ message: 'Forbidden: You do not own this event' });
+        throw new ForbiddenError('Forbidden: You do not own this event');
       }
 
       const fields = await db
@@ -1466,7 +1804,7 @@ router.get(
 
       return res.status(200).json(formatted);
     } catch (error) {
-      return res.status(500).json({ message: 'Internal server error' });
+      next(error);
     }
   },
 );
@@ -1563,27 +1901,27 @@ router.put(
   '/events/:id/custom-fields',
   requireAuth,
   requireRole('organizer'),
-  async (req: Request, res: Response) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     try {
       const eventId = req.params.id;
       const organizationId = req.user?.organizationId;
 
       const parsedId = z.string().uuid().safeParse(eventId);
       if (!parsedId.success) {
-        return res.status(404).json({ message: 'Event not found' });
+        throw new NotFoundError('Event not found');
       }
 
       if (!organizationId) {
-        return res.status(400).json({ message: 'Organizer has no organization ID associated' });
+        throw new ValidationError('Organizer has no organization ID associated');
       }
 
       const [existingEvent] = await db.select().from(events).where(eq(events.id, eventId)).limit(1);
       if (!existingEvent) {
-        return res.status(404).json({ message: 'Event not found' });
+        throw new NotFoundError('Event not found');
       }
 
       if (existingEvent.organizationId !== organizationId) {
-        return res.status(403).json({ message: 'Forbidden: You do not own this event' });
+        throw new ForbiddenError('Forbidden: You do not own this event');
       }
 
       const validated = customFieldsPutSchema.parse(req.body);
@@ -1620,15 +1958,12 @@ router.put(
       });
 
       if (registrationExists) {
-        return res.status(409).json({ message: 'cannot modify registration form after registrations exist' });
+        throw new ConflictError('cannot modify registration form after registrations exist');
       }
 
       return res.status(200).json({ message: 'Custom fields updated successfully' });
     } catch (error) {
-      if (error instanceof z.ZodError) {
-        return res.status(400).json({ errors: error.issues });
-      }
-      return res.status(500).json({ message: 'Internal server error' });
+      next(error);
     }
   },
 );
@@ -1735,27 +2070,27 @@ router.get(
   '/events/:id/registrations',
   requireAuth,
   requireRole('organizer'),
-  async (req: Request, res: Response) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     try {
       const eventId = req.params.id;
       const organizationId = req.user?.organizationId;
 
       const parsedId = z.string().uuid().safeParse(eventId);
       if (!parsedId.success) {
-        return res.status(404).json({ message: 'Event not found' });
+        throw new NotFoundError('Event not found');
       }
 
       if (!organizationId) {
-        return res.status(400).json({ message: 'Organizer has no organization ID associated' });
+        throw new ValidationError('Organizer has no organization ID associated');
       }
 
       const [existingEvent] = await db.select().from(events).where(eq(events.id, eventId)).limit(1);
       if (!existingEvent) {
-        return res.status(404).json({ message: 'Event not found' });
+        throw new NotFoundError('Event not found');
       }
 
       if (existingEvent.organizationId !== organizationId) {
-        return res.status(403).json({ message: 'Forbidden: You do not own this event' });
+        throw new ForbiddenError('Forbidden: You do not own this event');
       }
 
       const parsedQuery = registrationsQuerySchema.parse(req.query);
@@ -1835,10 +2170,7 @@ router.get(
         data,
       });
     } catch (error) {
-      if (error instanceof z.ZodError) {
-        return res.status(400).json({ errors: error.issues });
-      }
-      return res.status(500).json({ message: 'Internal server error' });
+      next(error);
     }
   },
 );

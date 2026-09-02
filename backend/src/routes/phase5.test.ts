@@ -386,7 +386,7 @@ describe('Phase 5 Integration Tests: Event Registration', () => {
         .send({ responses })
         .expect(400);
 
-      expect(res.body.message).toContain('is required');
+      expect(res.body.error.message).toContain('is required');
     });
 
     test('10. Invalid select/multiselect/checkbox/date/url values are rejected (400)', async () => {

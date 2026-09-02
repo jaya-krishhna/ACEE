@@ -1,4 +1,4 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import bcrypt from 'bcryptjs';
 import { eq, and } from 'drizzle-orm';
@@ -12,6 +12,7 @@ import {
 import { refreshTokens } from '../db/schema/refresh_tokens';
 import { hashToken, generateRandomToken, generateAccessToken } from '../utils/token';
 import { AuthUser } from '../middleware/auth';
+import { ValidationError, UnauthorizedError } from '../errors/AppError';
 
 const router = Router();
 
@@ -117,7 +118,7 @@ const acceptInviteSchema = z.object({
  *       400:
  *         description: Invalid input or email already registered.
  */
-router.post('/student/register', async (req: Request, res: Response) => {
+router.post('/student/register', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const validated = studentRegisterSchema.parse(req.body);
 
@@ -129,7 +130,7 @@ router.post('/student/register', async (req: Request, res: Response) => {
       .limit(1);
 
     if (existingUser) {
-      return res.status(400).json({ message: 'Email already registered' });
+      throw new ValidationError('Email already registered');
     }
 
     // Hash password
@@ -167,10 +168,7 @@ router.post('/student/register', async (req: Request, res: Response) => {
 
     return res.status(201).json({ accessToken });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({ errors: error.issues });
-    }
-    return res.status(500).json({ message: 'Internal server error' });
+    next(error);
   }
 });
 
@@ -209,19 +207,19 @@ router.post('/student/register', async (req: Request, res: Response) => {
  *       401:
  *         description: Incorrect credentials.
  */
-router.post('/student/login', async (req: Request, res: Response) => {
+router.post('/student/login', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const validated = studentLoginSchema.parse(req.body);
 
     const [user] = await db.select().from(users).where(eq(users.email, validated.email)).limit(1);
 
     if (!user || !user.passwordHash) {
-      return res.status(401).json({ message: 'Invalid email or password' });
+      throw new UnauthorizedError('Invalid email or password');
     }
 
     const isMatch = await bcrypt.compare(validated.password, user.passwordHash);
     if (!isMatch) {
-      return res.status(401).json({ message: 'Invalid email or password' });
+      throw new UnauthorizedError('Invalid email or password');
     }
 
     // Generate JWT access token
@@ -245,10 +243,7 @@ router.post('/student/login', async (req: Request, res: Response) => {
 
     return res.status(200).json({ accessToken });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({ errors: error.issues });
-    }
-    return res.status(500).json({ message: 'Internal server error' });
+    next(error);
   }
 });
 
@@ -319,7 +314,7 @@ router.post('/student/login', async (req: Request, res: Response) => {
  *       400:
  *         description: Invalid input or email already registered.
  */
-router.post('/organizer/register', async (req: Request, res: Response) => {
+router.post('/organizer/register', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const validated = organizerRegisterSchema.parse(req.body);
 
@@ -331,7 +326,7 @@ router.post('/organizer/register', async (req: Request, res: Response) => {
       .limit(1);
 
     if (existingAccount) {
-      return res.status(400).json({ message: 'Email already registered' });
+      throw new ValidationError('Email already registered');
     }
 
     let createdOwnerId: string | undefined;
@@ -399,10 +394,7 @@ router.post('/organizer/register', async (req: Request, res: Response) => {
 
     return res.status(201).json({ accessToken });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({ errors: error.issues });
-    }
-    return res.status(500).json({ message: 'Internal server error' });
+    next(error);
   }
 });
 
@@ -441,7 +433,7 @@ router.post('/organizer/register', async (req: Request, res: Response) => {
  *       401:
  *         description: Incorrect credentials.
  */
-router.post('/organizer/login', async (req: Request, res: Response) => {
+router.post('/organizer/login', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const validated = organizerLoginSchema.parse(req.body);
 
@@ -452,12 +444,12 @@ router.post('/organizer/login', async (req: Request, res: Response) => {
       .limit(1);
 
     if (!account || account.status === 'removed') {
-      return res.status(401).json({ message: 'Invalid email or password' });
+      throw new UnauthorizedError('Invalid email or password');
     }
 
     const isMatch = await bcrypt.compare(validated.password, account.passwordHash);
     if (!isMatch) {
-      return res.status(401).json({ message: 'Invalid email or password' });
+      throw new UnauthorizedError('Invalid email or password');
     }
 
     // Generate JWT access token
@@ -483,10 +475,7 @@ router.post('/organizer/login', async (req: Request, res: Response) => {
 
     return res.status(200).json({ accessToken });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({ errors: error.issues });
-    }
-    return res.status(500).json({ message: 'Internal server error' });
+    next(error);
   }
 });
 
@@ -509,11 +498,11 @@ router.post('/organizer/login', async (req: Request, res: Response) => {
  *       401:
  *         description: Missing, invalid, or expired refresh token.
  */
-router.post('/refresh', async (req: Request, res: Response) => {
+router.post('/refresh', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const rawRefreshToken = req.cookies.refreshToken;
     if (!rawRefreshToken) {
-      return res.status(401).json({ message: 'Unauthorized: Missing refresh token' });
+      throw new UnauthorizedError('Unauthorized: Missing refresh token');
     }
 
     const tokenHash = hashToken(rawRefreshToken);
@@ -526,7 +515,7 @@ router.post('/refresh', async (req: Request, res: Response) => {
       .limit(1);
 
     if (!storedToken) {
-      return res.status(401).json({ message: 'Unauthorized: Invalid refresh token' });
+      throw new UnauthorizedError('Unauthorized: Invalid refresh token');
     }
 
     // Check expiration
@@ -534,7 +523,7 @@ router.post('/refresh', async (req: Request, res: Response) => {
       // Invalidate expired token
       await db.delete(refreshTokens).where(eq(refreshTokens.tokenHash, tokenHash));
       clearRefreshCookie(res);
-      return res.status(401).json({ message: 'Unauthorized: Refresh token expired' });
+      throw new UnauthorizedError('Unauthorized: Refresh token expired');
     }
 
     // Invalidate/consume the existing refresh token before generating new ones (Token Rotation)
@@ -552,7 +541,7 @@ router.post('/refresh', async (req: Request, res: Response) => {
 
       if (!student) {
         clearRefreshCookie(res);
-        return res.status(401).json({ message: 'Unauthorized: Student account not found' });
+        throw new UnauthorizedError('Unauthorized: Student account not found');
       }
 
       authClaims = {
@@ -568,9 +557,7 @@ router.post('/refresh', async (req: Request, res: Response) => {
 
       if (!organizer || organizer.status === 'removed') {
         clearRefreshCookie(res);
-        return res
-          .status(401)
-          .json({ message: 'Unauthorized: Organizer account not found or disabled' });
+        throw new UnauthorizedError('Unauthorized: Organizer account not found or disabled');
       }
 
       authClaims = {
@@ -581,7 +568,7 @@ router.post('/refresh', async (req: Request, res: Response) => {
       };
     } else {
       clearRefreshCookie(res);
-      return res.status(401).json({ message: 'Unauthorized: Invalid token mapping' });
+      throw new UnauthorizedError('Unauthorized: Invalid token mapping');
     }
 
     // Generate new Access and Refresh tokens
@@ -601,7 +588,7 @@ router.post('/refresh', async (req: Request, res: Response) => {
 
     return res.status(200).json({ accessToken: newAccessToken });
   } catch (error) {
-    return res.status(500).json({ message: 'Internal server error' });
+    next(error);
   }
 });
 
@@ -615,7 +602,7 @@ router.post('/refresh', async (req: Request, res: Response) => {
  *       200:
  *         description: Logout successful.
  */
-router.post('/logout', async (req: Request, res: Response) => {
+router.post('/logout', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const rawRefreshToken = req.cookies.refreshToken;
     if (rawRefreshToken) {
@@ -628,7 +615,7 @@ router.post('/logout', async (req: Request, res: Response) => {
 
     return res.status(200).json({ message: 'Logged out successfully' });
   } catch (error) {
-    return res.status(500).json({ message: 'Internal server error' });
+    next(error);
   }
 });
 
@@ -662,7 +649,7 @@ router.post('/logout', async (req: Request, res: Response) => {
  *       400:
  *         description: Invalid or expired token.
  */
-router.post('/organizer/accept-invite', async (req: Request, res: Response) => {
+router.post('/organizer/accept-invite', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const validated = acceptInviteSchema.parse(req.body);
     const tokenHash = hashToken(validated.token);
@@ -675,16 +662,16 @@ router.post('/organizer/accept-invite', async (req: Request, res: Response) => {
       .limit(1);
 
     if (!invitation) {
-      return res.status(400).json({ message: 'Invalid invitation token' });
+      throw new ValidationError('Invalid invitation token');
     }
 
     // Check if invitation is expired, already used, or revoked
     if (invitation.status !== 'pending') {
-      return res.status(400).json({ message: `Invitation has already been ${invitation.status}` });
+      throw new ValidationError(`Invitation has already been ${invitation.status}`);
     }
 
     if (invitation.expiresAt < new Date()) {
-      return res.status(400).json({ message: 'Invitation has expired' });
+      throw new ValidationError('Invitation has expired');
     }
 
     // Verify user doesn't already exist with this email
@@ -695,9 +682,7 @@ router.post('/organizer/accept-invite', async (req: Request, res: Response) => {
       .limit(1);
 
     if (existingAccount) {
-      return res
-        .status(400)
-        .json({ message: 'An organizer account with this email already exists' });
+      throw new ValidationError('An organizer account with this email already exists');
     }
 
     const passwordHash = await bcrypt.hash(validated.password, 10);
@@ -728,10 +713,7 @@ router.post('/organizer/accept-invite', async (req: Request, res: Response) => {
       .status(200)
       .json({ message: 'Invitation accepted and account created successfully' });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({ errors: error.issues });
-    }
-    return res.status(500).json({ message: 'Internal server error' });
+    next(error);
   }
 });
 

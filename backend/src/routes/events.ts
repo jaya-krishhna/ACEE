@@ -1,4 +1,4 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { eq, desc, asc, and, count, inArray, lte, gte, SQL, sql } from 'drizzle-orm';
 import { db } from '../db/client';
@@ -20,6 +20,7 @@ import {
   eventCustomFields,
 } from '../db/schema';
 import { requireAuth, requireRole } from '../middleware/auth';
+import { ValidationError, NotFoundError, ForbiddenError, ConflictError } from '../errors/AppError';
 
 const router = Router();
 
@@ -213,7 +214,7 @@ const uuidSchema = z.string().uuid();
  *       400:
  *         description: Validation error
  */
-router.get('/', async (req: Request, res: Response) => {
+router.get('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const parsed = querySchema.parse(req.query);
     const conditions: (SQL | undefined)[] = [eq(events.status, 'published')];
@@ -315,10 +316,7 @@ router.get('/', async (req: Request, res: Response) => {
       data: formattedData,
     });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({ errors: error.issues });
-    }
-    return res.status(500).json({ message: 'Internal server error' });
+    next(error);
   }
 });
 
@@ -342,7 +340,7 @@ router.get('/', async (req: Request, res: Response) => {
  *       404:
  *         description: Event not found or not published
  */
-router.get('/:slug', async (req: Request, res: Response) => {
+router.get('/:slug', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const [eventRow] = await db
       .select()
@@ -351,7 +349,7 @@ router.get('/:slug', async (req: Request, res: Response) => {
       .limit(1);
 
     if (!eventRow) {
-      return res.status(404).json({ message: 'Event not found' });
+      throw new NotFoundError('Event not found');
     }
 
     let location: { city: string; state: string | null; country: string } | 'Online Event' | null =
@@ -518,7 +516,7 @@ router.get('/:slug', async (req: Request, res: Response) => {
 
     return res.status(200).json(response);
   } catch (error) {
-    return res.status(500).json({ message: 'Internal server error' });
+    next(error);
   }
 });
 
@@ -555,11 +553,11 @@ router.post(
   '/:id/save',
   requireAuth,
   requireRole('student'),
-  async (req: Request, res: Response) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     try {
       const parsedId = uuidSchema.safeParse(req.params.id);
       if (!parsedId.success) {
-        return res.status(404).json({ message: 'Event not found' });
+        throw new NotFoundError('Event not found');
       }
 
       const [eventRow] = await db
@@ -569,7 +567,7 @@ router.post(
         .limit(1);
 
       if (!eventRow) {
-        return res.status(404).json({ message: 'Event not found or not published' });
+        throw new NotFoundError('Event not found or not published');
       }
 
       await db
@@ -582,7 +580,7 @@ router.post(
 
       return res.status(200).json({ message: 'Event saved successfully' });
     } catch (error) {
-      return res.status(500).json({ message: 'Internal server error' });
+      next(error);
     }
   },
 );
@@ -620,11 +618,11 @@ router.delete(
   '/:id/save',
   requireAuth,
   requireRole('student'),
-  async (req: Request, res: Response) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     try {
       const parsedId = uuidSchema.safeParse(req.params.id);
       if (!parsedId.success) {
-        return res.status(404).json({ message: 'Event not found' });
+        throw new NotFoundError('Event not found');
       }
 
       await db
@@ -633,7 +631,7 @@ router.delete(
 
       return res.status(200).json({ message: 'Event unsaved successfully' });
     } catch (error) {
-      return res.status(500).json({ message: 'Internal server error' });
+      next(error);
     }
   },
 );
@@ -715,14 +713,14 @@ router.post(
   '/:id/register',
   requireAuth,
   requireRole('student'),
-  async (req: Request, res: Response) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     try {
       const eventId = req.params.id;
       const userId = req.user!.id;
 
       const parsedId = uuidSchema.safeParse(eventId);
       if (!parsedId.success) {
-        return res.status(404).json({ message: 'Event not found' });
+        throw new NotFoundError('Event not found');
       }
 
       let resultMessage = 'Registered successfully';
@@ -901,61 +899,61 @@ router.post(
       });
     } catch (error: any) {
       if (error instanceof z.ZodError) {
-        return res.status(400).json({ errors: error.issues });
+        return next(error);
       }
       // Map transactional error markers to HTTP statuses
       if (error.message === 'EVENT_NOT_FOUND') {
-        return res.status(404).json({ message: 'Event not found' });
+        return next(new NotFoundError('Event not found'));
       }
       if (error.message === 'REGISTRATION_NOT_OPEN') {
-        return res.status(400).json({ message: 'registration not yet open' });
+        return next(new ValidationError('registration not yet open'));
       }
       if (error.message === 'REGISTRATION_CLOSED') {
-        return res.status(400).json({ message: 'registration closed' });
+        return next(new ValidationError('registration closed'));
       }
       if (error.message === 'DUPLICATE_REGISTRATION') {
-        return res.status(409).json({ message: 'You are already registered for this event' });
+        return next(new ConflictError('You are already registered for this event'));
       }
       if (error.message === 'DUPLICATE_FIELD_RESPONSES') {
-        return res.status(400).json({ message: 'Duplicate responses for the same field are not allowed' });
+        return next(new ValidationError('Duplicate responses for the same field are not allowed'));
       }
       if (error.message.startsWith('FIELD_NOT_BELONGING:')) {
         const fieldId = error.message.split(':')[1];
-        return res.status(400).json({ message: `Field ID ${fieldId} does not belong to this event` });
+        return next(new ValidationError(`Field ID ${fieldId} does not belong to this event`));
       }
       if (error.message.startsWith('REQUIRED_FIELD_MISSING:')) {
         const label = error.message.split(':')[1];
-        return res.status(400).json({ message: `Field "${label}" is required` });
+        return next(new ValidationError(`Field "${label}" is required`));
       }
       if (error.message.startsWith('INVALID_SELECT_VALUE:')) {
         const label = error.message.split(':')[1];
-        return res.status(400).json({ message: `Value for field "${label}" is not a valid option` });
+        return next(new ValidationError(`Value for field "${label}" is not a valid option`));
       }
       if (error.message.startsWith('INVALID_MULTISELECT_JSON:')) {
         const label = error.message.split(':')[1];
-        return res.status(400).json({ message: `Value for multiselect field "${label}" must be a valid JSON array` });
+        return next(new ValidationError(`Value for multiselect field "${label}" must be a valid JSON array`));
       }
       if (error.message.startsWith('INVALID_MULTISELECT_FORMAT:')) {
         const label = error.message.split(':')[1];
-        return res.status(400).json({ message: `Value for multiselect field "${label}" must be a JSON array of strings` });
+        return next(new ValidationError(`Value for multiselect field "${label}" must be a JSON array of strings`));
       }
       if (error.message.startsWith('INVALID_MULTISELECT_VALUE:')) {
         const parts = error.message.split(':');
-        return res.status(400).json({ message: `Multiselect value "${parts[2]}" is not a valid option for field "${parts[1]}"` });
+        return next(new ValidationError(`Multiselect value "${parts[2]}" is not a valid option for field "${parts[1]}"`));
       }
       if (error.message.startsWith('INVALID_CHECKBOX_VALUE:')) {
         const label = error.message.split(':')[1];
-        return res.status(400).json({ message: `Value for checkbox field "${label}" must be "true" or "false"` });
+        return next(new ValidationError(`Value for checkbox field "${label}" must be "true" or "false"`));
       }
       if (error.message.startsWith('INVALID_DATE_VALUE:')) {
         const label = error.message.split(':')[1];
-        return res.status(400).json({ message: `Value for date field "${label}" must be a valid date string` });
+        return next(new ValidationError(`Value for date field "${label}" must be a valid date string`));
       }
       if (error.message.startsWith('INVALID_URL_VALUE:')) {
         const label = error.message.split(':')[1];
-        return res.status(400).json({ message: `Value for url field "${label}" must be a valid URL` });
+        return next(new ValidationError(`Value for url field "${label}" must be a valid URL`));
       }
-      return res.status(500).json({ message: 'Internal server error' });
+      next(error);
     }
   },
 );
@@ -998,14 +996,14 @@ router.delete(
   '/:id/register',
   requireAuth,
   requireRole('student'),
-  async (req: Request, res: Response) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     try {
       const eventId = req.params.id;
       const userId = req.user!.id;
 
       const parsedId = uuidSchema.safeParse(eventId);
       if (!parsedId.success) {
-        return res.status(404).json({ message: 'Event not found' });
+        throw new NotFoundError('Event not found');
       }
 
       let notFound = false;
@@ -1038,12 +1036,12 @@ router.delete(
       });
 
       if (notFound) {
-        return res.status(404).json({ message: 'Active registration not found for this event' });
+        throw new NotFoundError('Active registration not found for this event');
       }
 
       return res.status(200).json({ message: 'Registration cancelled successfully' });
     } catch (error) {
-      return res.status(500).json({ message: 'Internal server error' });
+      next(error);
     }
   },
 );

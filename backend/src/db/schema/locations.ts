@@ -1,4 +1,6 @@
-import { pgTable, serial, text, doublePrecision, unique } from 'drizzle-orm/pg-core';
+import { pgTable, serial, text, doublePrecision, unique, uuid, boolean, uniqueIndex } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
+import { organizations } from './organizations';
 
 export const locations = pgTable(
   'locations',
@@ -15,8 +17,19 @@ export const locations = pgTable(
   ],
 );
 
-export const eligibilityCategories = pgTable('eligibility_categories', {
-  id: serial('id').primaryKey(),
-  name: text('name').notNull().unique(),
-  slug: text('slug').notNull().unique(),
-});
+export const eligibilityCategories = pgTable(
+  'eligibility_categories',
+  {
+    id: serial('id').primaryKey(),
+    name: text('name').notNull(),
+    slug: text('slug').notNull(),
+    organizationId: uuid('organization_id').references(() => organizations.id, { onDelete: 'cascade' }),
+    isSystem: boolean('is_system').notNull().default(false),
+  },
+  (table) => [
+    uniqueIndex('idx_eligibility_categories_slug_system').on(table.slug).where(sql`is_system = true`),
+    uniqueIndex('idx_eligibility_categories_org_slug_custom')
+      .on(table.organizationId, table.slug)
+      .where(sql`is_system = false`),
+  ],
+);

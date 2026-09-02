@@ -67,9 +67,14 @@ CREATE TABLE locations (
 
 CREATE TABLE eligibility_categories (
     id                  SERIAL PRIMARY KEY,
-    name                TEXT NOT NULL UNIQUE,
-    slug                TEXT NOT NULL UNIQUE
+    name                TEXT NOT NULL,
+    slug                TEXT NOT NULL,
+    organization_id     UUID REFERENCES organizations(id) ON DELETE CASCADE,
+    is_system           BOOLEAN NOT NULL DEFAULT FALSE
 );
+
+CREATE UNIQUE INDEX idx_eligibility_categories_slug_system ON eligibility_categories (slug) WHERE is_system = true;
+CREATE UNIQUE INDEX idx_eligibility_categories_org_slug_custom ON eligibility_categories (organization_id, slug) WHERE is_system = false;
 
 CREATE TABLE event_eligibility (
     event_id                UUID NOT NULL REFERENCES events(id) ON DELETE CASCADE,
@@ -85,10 +90,15 @@ CREATE TABLE event_eligibility (
 ```sql
 CREATE TABLE tags (
     id                  SERIAL PRIMARY KEY,
-    name                TEXT NOT NULL UNIQUE,
-    slug                TEXT NOT NULL UNIQUE,
-    category            TEXT NOT NULL CHECK (category IN ('domain','technology','theme'))
+    name                TEXT NOT NULL,
+    slug                TEXT NOT NULL,
+    category            TEXT NOT NULL CHECK (category IN ('domain','technology','theme')),
+    organization_id     UUID REFERENCES organizations(id) ON DELETE CASCADE,
+    is_system           BOOLEAN NOT NULL DEFAULT FALSE
 );
+
+CREATE UNIQUE INDEX idx_tags_slug_system ON tags (slug) WHERE is_system = true;
+CREATE UNIQUE INDEX idx_tags_org_slug_custom ON tags (organization_id, slug) WHERE is_system = false;
 
 CREATE TABLE event_tags (
     event_id            UUID NOT NULL REFERENCES events(id) ON DELETE CASCADE,

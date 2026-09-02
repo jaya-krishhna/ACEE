@@ -101,6 +101,7 @@ beforeAll(async () => {
       name: 'React',
       slug: 'react',
       category: 'technology',
+      isSystem: true,
     })
     .returning();
   tagIdA = tagA.id;
@@ -111,6 +112,7 @@ beforeAll(async () => {
       name: 'AI',
       slug: 'ai',
       category: 'technology',
+      isSystem: true,
     })
     .returning();
   tagIdB = tagB.id;
@@ -121,6 +123,7 @@ beforeAll(async () => {
     .values({
       name: 'Undergrad',
       slug: 'undergrad',
+      isSystem: true,
     })
     .returning();
   categoryIdA = catA.id;

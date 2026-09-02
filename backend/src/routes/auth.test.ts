@@ -80,7 +80,7 @@ describe('Student Authentication', () => {
 
     const res = await request(app).post('/api/auth/student/register').send(studentData).expect(400);
 
-    expect(res.body.message).toContain('already registered');
+    expect(res.body.error.message).toContain('already registered');
   });
 
   test('4. Correct login succeeds; incorrect password fails', async () => {

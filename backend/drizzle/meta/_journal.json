@@ -36,6 +36,20 @@
       "when": 1788156348714,
       "tag": "0004_omniscient_steel_serpent",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1788160000000,
+      "tag": "0005_events_mode_location_consistency",
+      "breakpoints": false
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1788161000000,
+      "tag": "0006_two_tier_taxonomies",
+      "breakpoints": false
     }
   ]
 }
